@@ -303,7 +303,7 @@ PLATFORMS
   ruby
 
 DEPENDENCIES
-  github-pages
+  github-pages (>= 224)
   html-proofer
   mdl
   rake
