@@ -1,4 +1,4 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "abstract_command"
@@ -6,21 +6,22 @@ require "fileutils"
 require "formula"
 require "utils/bottles"
 require "tab"
+require "sbom"
 require "keg"
 require "formula_versions"
-require "cli/parser"
 require "utils/inreplace"
 require "erb"
 require "utils/gzip"
 require "api"
 require "extend/hash/deep_merge"
+require "metafiles"
 
 module Homebrew
   module DevCmd
     class Bottle < AbstractCommand
       include FileUtils
 
-      BOTTLE_ERB = <<-EOS.freeze
+      BOTTLE_ERB = T.let(<<-EOS.freeze, String)
   bottle do
     <% if [HOMEBREW_BOTTLE_DEFAULT_DOMAIN.to_s,
            "#{HOMEBREW_BOTTLE_DEFAULT_DOMAIN}/bottles"].exclude?(root_url) %>
@@ -39,9 +40,9 @@ module Homebrew
 
       MAXIMUM_STRING_MATCHES = 100
 
-      ALLOWABLE_HOMEBREW_REPOSITORY_LINKS = [
+      ALLOWABLE_HOMEBREW_REPOSITORY_LINKS = T.let([
         %r{#{Regexp.escape(HOMEBREW_LIBRARY)}/Homebrew/os/(mac|linux)/pkgconfig},
-      ].freeze
+      ].freeze, T::Array[Regexp])
 
       cmd_args do
         description <<~EOS
@@ -101,23 +102,144 @@ module Homebrew
           return merge
         end
 
-        gnu_tar_formula_ensure_installed_if_needed!
+        Homebrew.install_bundler_gems!(groups: ["bottle"])
+
+        gnu_tar_formula_ensure_installed_if_needed! if args.only_json_tab?
 
         args.named.to_resolved_formulae(uniq: false).each do |formula|
           bottle_formula formula
         end
       end
 
+      sig {
+        params(tag: Symbol, digest: T.any(Checksum, String), cellar: T.nilable(T.any(String, Symbol)),
+               tag_column: Integer, digest_column: Integer).returns(String)
+      }
+      def generate_sha256_line(tag, digest, cellar, tag_column, digest_column)
+        line = "sha256 "
+        tag_column += line.length
+        digest_column += line.length
+        if cellar.is_a?(Symbol)
+          line += "cellar: :#{cellar},"
+        elsif cellar_parameter_needed?(cellar)
+          line += %Q(cellar: "#{cellar}",)
+        end
+        line += " " * (tag_column - line.length)
+        line += "#{tag}:"
+        line += " " * (digest_column - line.length)
+        %Q(#{line}"#{digest}")
+      end
+
+      sig { params(bottle: BottleSpecification, root_url_using: T.nilable(String)).returns(String) }
+      def bottle_output(bottle, root_url_using)
+        cellars = bottle.checksums.filter_map do |checksum|
+          cellar = checksum["cellar"]
+          next unless cellar_parameter_needed? cellar
+
+          case cellar
+          when String
+            %Q("#{cellar}")
+          when Symbol
+            ":#{cellar}"
+          end
+        end
+        tag_column = cellars.empty? ? 0 : "cellar: #{cellars.max_by(&:length)}, ".length
+
+        tags = bottle.checksums.map { |checksum| checksum["tag"] }
+        # Start where the tag ends, add the max length of the tag, add two for the `: `
+        digest_column = tag_column + tags.max_by(&:length).length + 2
+
+        sha256_lines = bottle.checksums.map do |checksum|
+          generate_sha256_line(checksum["tag"], checksum["digest"], checksum["cellar"], tag_column, digest_column)
+        end
+        erb_binding = bottle.instance_eval { binding }
+        erb_binding.local_variable_set(:sha256_lines, sha256_lines)
+        erb_binding.local_variable_set(:root_url_using, root_url_using)
+        erb = ERB.new BOTTLE_ERB
+        erb.result(erb_binding).gsub(/^\s*$\n/, "")
+      end
+
+      sig { params(filenames: T::Array[String]).returns(T::Array[T::Hash[String, T.untyped]]) }
+      def parse_json_files(filenames)
+        filenames.map do |filename|
+          JSON.parse(File.read(filename))
+        end
+      end
+
+      sig { params(json_files: T::Array[T::Hash[String, T.untyped]]).returns(T::Hash[String, T.untyped]) }
+      def merge_json_files(json_files)
+        json_files.reduce({}) do |hash, json_file|
+          json_file.each_value do |json_hash|
+            json_bottle = json_hash["bottle"]
+            cellar = json_bottle.delete("cellar")
+            json_bottle["tags"].each_value do |json_platform|
+              json_platform["cellar"] ||= cellar
+            end
+          end
+          hash.deep_merge(json_file)
+        end
+      end
+
+      sig {
+        params(old_keys: T::Array[String], old_bottle_spec: BottleSpecification,
+               new_bottle_hash: T::Hash[String, T.untyped]).returns(T::Array[T::Array[String]])
+      }
+      def merge_bottle_spec(old_keys, old_bottle_spec, new_bottle_hash)
+        mismatches = []
+        checksums = []
+
+        new_values = {
+          root_url: new_bottle_hash["root_url"],
+          rebuild:  new_bottle_hash["rebuild"],
+        }
+
+        skip_keys = [:sha256, :cellar]
+        old_keys.each do |key|
+          next if skip_keys.include?(key)
+
+          old_value = old_bottle_spec.send(key).to_s
+          new_value = new_values[key].to_s
+
+          next if old_value.present? && new_value == old_value
+
+          mismatches << "#{key}: old: #{old_value.inspect}, new: #{new_value.inspect}"
+        end
+
+        return [mismatches, checksums] if old_keys.exclude? :sha256
+
+        old_bottle_spec.collector.each_tag do |tag|
+          old_tag_spec = old_bottle_spec.collector.specification_for(tag)
+          old_hexdigest = old_tag_spec.checksum.hexdigest
+          old_cellar = old_tag_spec.cellar
+          new_value = new_bottle_hash.dig("tags", tag.to_s)
+          if new_value.present? && new_value["sha256"] != old_hexdigest
+            mismatches << "sha256 #{tag}: old: #{old_hexdigest.inspect}, new: #{new_value["sha256"].inspect}"
+          elsif new_value.present? && new_value["cellar"] != old_cellar.to_s
+            mismatches << "cellar #{tag}: old: #{old_cellar.to_s.inspect}, new: #{new_value["cellar"].inspect}"
+          else
+            checksums << { cellar: old_cellar, tag.to_sym => old_hexdigest }
+          end
+        end
+
+        [mismatches, checksums]
+      end
+
+      private
+
+      sig {
+        params(string: String, keg: Keg, ignores: T::Array[String],
+               formula_and_runtime_deps_names: T.nilable(T::Array[String])).returns(T::Boolean)
+      }
       def keg_contain?(string, keg, ignores, formula_and_runtime_deps_names = nil)
         @put_string_exists_header, @put_filenames = nil
 
         print_filename = lambda do |str, filename|
           unless @put_string_exists_header
             opoo "String '#{str}' still exists in these files:"
-            @put_string_exists_header = true
+            @put_string_exists_header = T.let(true, T.nilable(T::Boolean))
           end
 
-          @put_filenames ||= []
+          @put_filenames ||= T.let([], T.nilable(T::Array[T.any(String, Pathname)]))
 
           return false if @put_filenames.include?(filename)
 
@@ -159,6 +281,7 @@ module Homebrew
         keg_contain_absolute_symlink_starting_with?(string, keg) || result
       end
 
+      sig { params(string: String, keg: Keg).returns(T::Boolean) }
       def keg_contain_absolute_symlink_starting_with?(string, keg)
         absolute_symlinks_start_with_string = []
         keg.find do |pn|
@@ -177,6 +300,7 @@ module Homebrew
         !absolute_symlinks_start_with_string.empty?
       end
 
+      sig { params(cellar: T.nilable(T.any(String, Symbol))).returns(T::Boolean) }
       def cellar_parameter_needed?(cellar)
         default_cellars = [
           Homebrew::DEFAULT_MACOS_CELLAR,
@@ -186,49 +310,7 @@ module Homebrew
         cellar.present? && default_cellars.exclude?(cellar)
       end
 
-      def generate_sha256_line(tag, digest, cellar, tag_column, digest_column)
-        line = "sha256 "
-        tag_column += line.length
-        digest_column += line.length
-        if cellar.is_a?(Symbol)
-          line += "cellar: :#{cellar},"
-        elsif cellar_parameter_needed?(cellar)
-          line += %Q(cellar: "#{cellar}",)
-        end
-        line += " " * (tag_column - line.length)
-        line += "#{tag}:"
-        line += " " * (digest_column - line.length)
-        %Q(#{line}"#{digest}")
-      end
-
-      def bottle_output(bottle, root_url_using)
-        cellars = bottle.checksums.filter_map do |checksum|
-          cellar = checksum["cellar"]
-          next unless cellar_parameter_needed? cellar
-
-          case cellar
-          when String
-            %Q("#{cellar}")
-          when Symbol
-            ":#{cellar}"
-          end
-        end
-        tag_column = cellars.empty? ? 0 : "cellar: #{cellars.max_by(&:length)}, ".length
-
-        tags = bottle.checksums.map { |checksum| checksum["tag"] }
-        # Start where the tag ends, add the max length of the tag, add two for the `: `
-        digest_column = tag_column + tags.max_by(&:length).length + 2
-
-        sha256_lines = bottle.checksums.map do |checksum|
-          generate_sha256_line(checksum["tag"], checksum["digest"], checksum["cellar"], tag_column, digest_column)
-        end
-        erb_binding = bottle.instance_eval { binding }
-        erb_binding.local_variable_set(:sha256_lines, sha256_lines)
-        erb_binding.local_variable_set(:root_url_using, root_url_using)
-        erb = ERB.new BOTTLE_ERB
-        erb.result(erb_binding).gsub(/^\s*$\n/, "")
-      end
-
+      sig { returns(T.nilable(T::Boolean)) }
       def sudo_purge
         return unless ENV["HOMEBREW_BOTTLE_SUDO_PURGE"]
 
@@ -277,11 +359,11 @@ module Homebrew
         gnu_tar_formula
       end
 
-      sig { params(mtime: String).returns([String, T::Array[String]]) }
-      def setup_tar_and_args!(mtime)
+      sig { params(mtime: String, default_tar: T::Boolean).returns([String, T::Array[String]]) }
+      def setup_tar_and_args!(mtime, default_tar: false)
         # Without --only-json-tab bottles are never reproducible
         default_tar_args = ["tar", tar_args].freeze
-        return default_tar_args unless args.only_json_tab?
+        return default_tar_args if !args.only_json_tab? || default_tar
 
         # Use gnu-tar as it can be set up for reproducibility better than libarchive
         # and to be consistent between macOS and Linux.
@@ -291,6 +373,7 @@ module Homebrew
         [gnu_tar(gnu_tar_formula), reproducible_gnutar_args(mtime)].freeze
       end
 
+      sig { params(formula: T.untyped).returns(T::Array[T.untyped]) }
       def formula_ignores(formula)
         ignores = []
         cellar_regex = Regexp.escape(HOMEBREW_CELLAR)
@@ -321,6 +404,7 @@ module Homebrew
         ignores.compact
       end
 
+      sig { params(formula: Formula).void }
       def bottle_formula(formula)
         local_bottle_json = args.json? && formula.local_bottle_path.present?
 
@@ -390,6 +474,8 @@ module Homebrew
 
         if local_bottle_json
           bottle_path = formula.local_bottle_path
+          return if bottle_path.blank?
+
           local_filename = bottle_path.basename.to_s
 
           tab_path = Utils::Bottles.receipt_path(bottle_path)
@@ -408,6 +494,7 @@ module Homebrew
         else
           tar_filename = filename.to_s.sub(/.gz$/, "")
           tar_path = Pathname.pwd/tar_filename
+          return if tar_path.blank?
 
           keg = Keg.new(formula.prefix)
         end
@@ -431,17 +518,21 @@ module Homebrew
             Tab.clear_cache
             Dependency.clear_cache
             Requirement.clear_cache
-            tab = Tab.for_keg(keg)
+
+            tab = keg.tab
             original_tab = tab.dup
             tab.poured_from_bottle = false
             tab.time = nil
             tab.changed_files = changed_files.dup
             if args.only_json_tab?
-              tab.changed_files.delete(Pathname.new(Tab::FILENAME))
+              tab.changed_files.delete(Pathname.new(AbstractTab::FILENAME))
               tab.tabfile.unlink
             else
               tab.write
             end
+
+            sbom = SBOM.create(formula, tab)
+            sbom.write(bottling: true)
 
             keg.consistent_reproducible_symlink_permissions!
 
@@ -449,7 +540,7 @@ module Homebrew
               sudo_purge
               # Tar then gzip for reproducible bottles.
               tar_mtime = tab.source_modified_time.strftime("%Y-%m-%d %H:%M:%S")
-              tar, tar_args = setup_tar_and_args!(tar_mtime)
+              tar, tar_args = setup_tar_and_args!(tar_mtime, default_tar: formula.name == "gnu-tar")
               safe_system tar, "--create", "--numeric-owner",
                           *tar_args,
                           "--file", tar_path, "#{formula.name}/#{formula.pkg_version}"
@@ -561,6 +652,18 @@ module Homebrew
 
         return unless args.json?
 
+        if keg
+          keg_prefix = "#{keg}/"
+          path_exec_files = [keg/"bin", keg/"sbin"].select(&:exist?)
+                                                   .flat_map(&:children)
+                                                   .select(&:executable?)
+                                                   .map { |path| path.to_s.delete_prefix(keg_prefix) }
+          all_files = keg.find
+                         .select(&:file?)
+                         .map { |path| path.to_s.delete_prefix(keg_prefix) }
+          installed_size = keg.disk_usage
+        end
+
         json = {
           formula.full_name => {
             "formula" => {
@@ -582,13 +685,18 @@ module Homebrew
               "root_url" => bottle.root_url,
               "cellar"   => bottle_cellar.to_s,
               "rebuild"  => bottle.rebuild,
-              "date"     => Pathname(filename.to_s).mtime.strftime("%F"),
+              # date is used for org.opencontainers.image.created which is an RFC 3339 date-time.
+              # Time#iso8601 produces an XML Schema date-time that meets RFC 3339 ABNF.
+              "date"     => Pathname(filename.to_s).mtime.utc.iso8601,
               "tags"     => {
                 bottle_tag.to_s => {
-                  "filename"       => filename.url_encode,
-                  "local_filename" => filename.to_s,
-                  "sha256"         => sha256,
-                  "tab"            => tab.to_bottle_hash,
+                  "filename"        => filename.url_encode,
+                  "local_filename"  => filename.to_s,
+                  "sha256"          => sha256,
+                  "tab"             => tab.to_bottle_hash,
+                  "path_exec_files" => path_exec_files,
+                  "all_files"       => all_files,
+                  "installed_size"  => installed_size,
                 },
               },
             },
@@ -601,25 +709,7 @@ module Homebrew
         json_path.write(JSON.pretty_generate(json))
       end
 
-      def parse_json_files(filenames)
-        filenames.map do |filename|
-          JSON.parse(File.read(filename))
-        end
-      end
-
-      def merge_json_files(json_files)
-        json_files.reduce({}) do |hash, json_file|
-          json_file.each_value do |json_hash|
-            json_bottle = json_hash["bottle"]
-            cellar = json_bottle.delete("cellar")
-            json_bottle["tags"].each_value do |json_platform|
-              json_platform["cellar"] ||= cellar
-            end
-          end
-          hash.deep_merge(json_file)
-        end
-      end
-
+      sig { returns(T::Hash[String, T.untyped]) }
       def merge
         bottles_hash = merge_json_files(parse_json_files(args.named))
 
@@ -652,6 +742,14 @@ module Homebrew
                        (!old_bottle_spec_matches || bottle.rebuild != old_bottle_spec.rebuild) &&
                        tag_hashes.count > 1 &&
                        tag_hashes.uniq { |tag_hash| "#{tag_hash["cellar"]}-#{tag_hash["sha256"]}" }.count == 1
+
+          old_all_bottle = old_bottle_spec.tag?(Utils::Bottles.tag(:all))
+          if !all_bottle && old_all_bottle && !args.no_all_checks?
+            odie <<~ERROR
+              #{formula} should have an `:all` bottle but one cannot be created:
+              #{JSON.pretty_generate(tag_hashes)}
+            ERROR
+          end
 
           bottle_hash["bottle"]["tags"].each do |tag, tag_hash|
             cellar = tag_hash["cellar"]
@@ -689,7 +787,7 @@ module Homebrew
             end
           end
 
-          all_bottle_hash = T.let(nil, T.nilable(Hash))
+          all_bottle_hash = T.let(nil, T.nilable(T::Hash[String, T.untyped]))
           bottle_hash["bottle"]["tags"].each do |tag, tag_hash|
             filename = ::Bottle::Filename.new(
               formula_name,
@@ -740,7 +838,7 @@ module Homebrew
           checksums = old_checksums(formula, formula_ast, bottle_hash)
           update_or_add = checksums.nil? ? "add" : "update"
 
-          checksums&.each(&bottle.method(:sha256))
+          checksums&.each { |checksum| bottle.sha256(checksum) }
           output = bottle_output(bottle, args.root_url_using)
           puts output
 
@@ -774,48 +872,12 @@ module Homebrew
         end
       end
 
-      def merge_bottle_spec(old_keys, old_bottle_spec, new_bottle_hash)
-        mismatches = []
-        checksums = []
-
-        new_values = {
-          root_url: new_bottle_hash["root_url"],
-          rebuild:  new_bottle_hash["rebuild"],
-        }
-
-        skip_keys = [:sha256, :cellar]
-        old_keys.each do |key|
-          next if skip_keys.include?(key)
-
-          old_value = old_bottle_spec.send(key).to_s
-          new_value = new_values[key].to_s
-
-          next if old_value.present? && new_value == old_value
-
-          mismatches << "#{key}: old: #{old_value.inspect}, new: #{new_value.inspect}"
-        end
-
-        return [mismatches, checksums] if old_keys.exclude? :sha256
-
-        old_bottle_spec.collector.each_tag do |tag|
-          old_tag_spec = old_bottle_spec.collector.specification_for(tag)
-          old_hexdigest = old_tag_spec.checksum.hexdigest
-          old_cellar = old_tag_spec.cellar
-          new_value = new_bottle_hash.dig("tags", tag.to_s)
-          if new_value.present? && new_value["sha256"] != old_hexdigest
-            mismatches << "sha256 #{tag}: old: #{old_hexdigest.inspect}, new: #{new_value["sha256"].inspect}"
-          elsif new_value.present? && new_value["cellar"] != old_cellar.to_s
-            mismatches << "cellar #{tag}: old: #{old_cellar.to_s.inspect}, new: #{new_value["cellar"].inspect}"
-          else
-            checksums << { cellar: old_cellar, tag.to_sym => old_hexdigest }
-          end
-        end
-
-        [mismatches, checksums]
-      end
-
+      sig {
+        params(formula: Formula, formula_ast: Utils::AST::FormulaAST,
+               bottle_hash: T::Hash[String, T.untyped]).returns(T.nilable(T::Array[String]))
+      }
       def old_checksums(formula, formula_ast, bottle_hash)
-        bottle_node = formula_ast.bottle_block
+        bottle_node = T.cast(formula_ast.bottle_block, T.nilable(RuboCop::AST::BlockNode))
         return if bottle_node.nil?
         return [] unless args.keep_old?
 

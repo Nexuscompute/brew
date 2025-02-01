@@ -1,4 +1,4 @@
-# typed: true
+# typed: true # rubocop:todo Sorbet/StrictSigil
 # frozen_string_literal: true
 
 # This script is loaded by formula_installer as a separate instance.
@@ -13,12 +13,11 @@ require "build_options"
 require "keg"
 require "extend/ENV"
 require "fcntl"
-require "socket"
+require "utils/socket"
 require "cmd/install"
+require "json/add/exception"
 
 # A formula build.
-#
-# @api private
 class Build
   attr_reader :formula, :deps, :reqs, :args
 
@@ -76,9 +75,10 @@ class Build
     ENV.activate_extensions!(env: args.env)
 
     if superenv?(args.env)
-      ENV.keg_only_deps = keg_only_deps
-      ENV.deps = formula_deps
-      ENV.run_time_deps = run_time_deps
+      superenv = T.cast(ENV, Superenv)
+      superenv.keg_only_deps = keg_only_deps
+      superenv.deps = formula_deps
+      superenv.run_time_deps = run_time_deps
       ENV.setup_build_environment(
         formula:,
         cc:            args.cc,
@@ -123,7 +123,7 @@ class Build
     }
 
     with_env(new_env) do
-      if args.debug?
+      if args.debug? && !Homebrew::EnvConfig.disable_debrew?
         require "debrew"
         formula.extend(Debrew::Formula)
       end
@@ -217,10 +217,11 @@ class Build
 end
 
 begin
-  args = Homebrew.install_args.parse
+  ENV.delete("HOMEBREW_FORBID_PACKAGES_FROM_PATHS")
+  args = Homebrew::Cmd::InstallCmd.new.args
   Context.current = args.context
 
-  error_pipe = UNIXSocket.open(ENV.fetch("HOMEBREW_ERROR_PIPE"), &:recv_io)
+  error_pipe = Utils::UNIXSocketExt.open(ENV.fetch("HOMEBREW_ERROR_PIPE"), &:recv_io)
   error_pipe.fcntl(Fcntl::F_SETFD, Fcntl::FD_CLOEXEC)
 
   trap("INT", old_trap)
@@ -229,6 +230,8 @@ begin
   options = Options.create(args.flags_only)
   build   = Build.new(formula, options, args:)
   build.install
+# Any exception means the build did not complete.
+# The `case` for what to do per-exception class is further down.
 rescue Exception => e # rubocop:disable Lint/RescueException
   error_hash = JSON.parse e.to_json
 

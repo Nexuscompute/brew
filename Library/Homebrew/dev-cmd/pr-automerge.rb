@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 
 require "abstract_command"
-require "cli/parser"
+require "tap"
 require "utils/github"
 
 module Homebrew
@@ -29,11 +29,6 @@ module Homebrew
         switch "--autosquash",
                description: "Instruct `brew pr-publish` to automatically reformat and reword commits " \
                             "in the pull request to the preferred format."
-        switch "--no-autosquash",
-               description: "Instruct `brew pr-publish` to skip automatically reformatting and rewording commits " \
-                            "in the pull request to the preferred format.",
-               disable:     true, # odisabled: remove this switch with 4.3.0
-               hidden:      true
         switch "--ignore-failures",
                description: "Include pull requests that have failing status checks."
 

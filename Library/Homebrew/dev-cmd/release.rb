@@ -2,7 +2,6 @@
 # frozen_string_literal: true
 
 require "abstract_command"
-require "cli/parser"
 
 module Homebrew
   module DevCmd
@@ -30,6 +29,8 @@ module Homebrew
       sig { override.void }
       def run
         safe_system "git", "-C", HOMEBREW_REPOSITORY, "fetch", "origin" if Homebrew::EnvConfig.no_auto_update?
+
+        require "utils/github"
 
         begin
           latest_release = GitHub.get_latest_release "Homebrew", "brew"

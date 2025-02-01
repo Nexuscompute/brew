@@ -1,8 +1,7 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "abstract_command"
-require "cli/parser"
 require "fileutils"
 
 module Homebrew
@@ -41,12 +40,13 @@ module Homebrew
         ENV["HOMEBREW_DEV_CMD_RUN"] = nil
         ENV["HOMEBREW_MERGE"] = nil
         ENV["HOMEBREW_NO_UPDATE_CLEANUP"] = nil
+        ENV["HOMEBREW_UPDATE_TO_TAG"] = nil
 
         branch = if args.to_tag?
           ENV["HOMEBREW_UPDATE_TO_TAG"] = "1"
           "stable"
         else
-          ENV["HOMEBREW_UPDATE_TO_TAG"] = nil
+          ENV["HOMEBREW_DEV_CMD_RUN"] = "1"
           "master"
         end
 
@@ -117,7 +117,7 @@ module Homebrew
           # update ENV["PATH"]
           ENV["PATH"] = PATH.new(ENV.fetch("PATH")).prepend(curdir/"bin").to_s
 
-          # run brew help to install portable-ruby (if needed)
+          # Run `brew help` to install `portable-ruby` (if needed).
           quiet_system "brew", "help"
 
           # run brew update

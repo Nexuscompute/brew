@@ -1,10 +1,10 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 module Homebrew
   module Livecheck
     module Strategy
-      # The {Json} strategy fetches content at a URL, parses it as JSON, and
+      # The {Json} strategy fetches content at a URL, parses it as JSON and
       # provides the parsed data to a `strategy` block. If a regex is present
       # in the `livecheck` block, it should be passed as the second argument to
       # the `strategy` block.
@@ -58,8 +58,10 @@ module Homebrew
         end
 
         # Parses JSON text and identifies versions using a `strategy` block.
-        # If a regex is provided, it will be passed as the second argument to
-        # the  `strategy` block (after the parsed JSON data).
+        # If the block has two parameters, the parsed JSON data will be used as
+        # the first argument and the regex (if any) will be the second.
+        # Otherwise, only the parsed JSON data will be passed to the block.
+        #
         # @param content [String] the JSON text to parse and check
         # @param regex [Regexp, nil] a regex used for matching versions in the
         #   content
@@ -77,10 +79,8 @@ module Homebrew
           json = parse_json(content)
           return [] if json.blank?
 
-          block_return_value = if regex.present?
+          block_return_value = if block.arity == 2
             yield(json, regex)
-          elsif block.arity == 2
-            raise "Two arguments found in `strategy` block but no regex provided."
           else
             yield(json)
           end

@@ -2,7 +2,8 @@
 # frozen_string_literal: true
 
 require "abstract_command"
-require "cli/parser"
+require "tap"
+require "utils/bottles"
 require "utils/github"
 
 module Homebrew

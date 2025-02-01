@@ -1,4 +1,4 @@
-# typed: true
+# typed: true # rubocop:todo Sorbet/StrictSigil
 # frozen_string_literal: true
 
 require "digest"
@@ -6,8 +6,6 @@ require "erb"
 
 module Homebrew
   # Class for generating a formula from a template.
-  #
-  # @api private
   class FormulaCreator
     attr_accessor :name
 
@@ -101,14 +99,12 @@ module Homebrew
 
     sig { returns(String) }
     def template
+      # FIXME: https://github.com/errata-ai/vale/issues/818
+      # <!-- vale off -->
       <<~ERB
         # Documentation: https://docs.brew.sh/Formula-Cookbook
         #                https://rubydoc.brew.sh/Formula
         # PLEASE REMOVE ALL GENERATED COMMENTS BEFORE SUBMITTING YOUR PULL REQUEST!
-        <% if @mode == :node %>
-        require "language/node"
-
-        <% end %>
         class #{Formulary.class_s(name)} < Formula
         <% if @mode == :python %>
           include Language::Python::Virtualenv
@@ -142,7 +138,7 @@ module Homebrew
         <% elsif @mode == :perl %>
           uses_from_macos "perl"
         <% elsif @mode == :python %>
-          depends_on "python"
+          depends_on "python@x.y"
         <% elsif @mode == :ruby %>
           uses_from_macos "ruby"
         <% elsif @mode == :rust %>
@@ -151,7 +147,7 @@ module Homebrew
           # depends_on "cmake" => :build
         <% end %>
 
-        <% if @mode == :perl %>
+        <% if @mode == :perl || :python || :ruby %>
           # Additional dependency
           # resource "" do
           #   url ""
@@ -179,20 +175,20 @@ module Homebrew
             system "meson", "compile", "-C", "build", "--verbose"
             system "meson", "install", "-C", "build"
         <% elsif @mode == :node %>
-            system "npm", "install", *Language::Node.std_npm_install_args(libexec)
+            system "npm", "install", *std_npm_args
             bin.install_symlink Dir["\#{libexec}/bin/*"]
         <% elsif @mode == :perl %>
             ENV.prepend_create_path "PERL5LIB", libexec/"lib/perl5"
             ENV.prepend_path "PERL5LIB", libexec/"lib"
 
-            # Stage additional dependency (Makefile.PL style)
+            # Stage additional dependency (`Makefile.PL` style).
             # resource("").stage do
             #   system "perl", "Makefile.PL", "INSTALL_BASE=\#{libexec}"
             #   system "make"
             #   system "make", "install"
             # end
 
-            # Stage additional dependency (Build.PL style)
+            # Stage additional dependency (`Build.PL` style).
             # resource("").stage do
             #   system "perl", "Build.PL", "--install_base", libexec
             #   system "./Build"
@@ -205,8 +201,10 @@ module Homebrew
             virtualenv_install_with_resources
         <% elsif @mode == :ruby %>
             ENV["GEM_HOME"] = libexec
+
+            system "bundle", "install", "-without", "development", "test"
             system "gem", "build", "\#{name}.gemspec"
-            system "gem", "install", "\#{name}-\#{@version}.gem"
+            system "gem", "install", "\#{name}-\#{version}.gem"
             bin.install libexec/"bin/\#{name}"
             bin.env_script_all_files(libexec/"bin", GEM_HOME: ENV["GEM_HOME"])
         <% elsif @mode == :rust %>
@@ -228,11 +226,12 @@ module Homebrew
             # to `brew install` such as `--HEAD` also need to be provided to `brew test`.
             #
             # The installed folder is not in the path, so use the entire path to any
-            # executables being tested: `system "\#{bin}/program", "do", "something"`.
+            # executables being tested: `system bin/"program", "do", "something"`.
             system "false"
           end
         end
       ERB
+      # <!-- vale on -->
     end
   end
 end

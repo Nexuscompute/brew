@@ -1,4 +1,4 @@
-# typed: true
+# typed: true # rubocop:todo Sorbet/StrictSigil
 # frozen_string_literal: true
 
 require "cask/artifact/relocated"
@@ -6,8 +6,6 @@ require "cask/artifact/relocated"
 module Cask
   module Artifact
     # Superclass for all artifacts which are installed by symlinking them to the target location.
-    #
-    # @api private
     class Symlinked < Relocated
       sig { returns(String) }
       def self.link_type_english_name

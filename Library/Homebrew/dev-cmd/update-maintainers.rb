@@ -2,7 +2,6 @@
 # frozen_string_literal: true
 
 require "abstract_command"
-require "cli/parser"
 require "utils/github"
 require "manpages"
 require "system_command"
@@ -26,9 +25,6 @@ module Homebrew
         public_members = GitHub.public_member_usernames("Homebrew")
         maintainers = GitHub.members_by_team("Homebrew", "maintainers")
 
-        HOMEBREW_MAINTAINER_JSON.write(maintainers.keys.to_json)
-        maintainer_json_relative_path = HOMEBREW_MAINTAINER_JSON.relative_path_from(HOMEBREW_REPOSITORY).to_s
-
         members = {
           plc:         GitHub.members_by_team("Homebrew", "plc"),
           tsc:         GitHub.members_by_team("Homebrew", "tsc"),
@@ -39,7 +35,7 @@ module Homebrew
         members.each do |group, hash|
           hash.replace(hash.slice(*public_members))
           hash.each { |login, name| hash[login] = "[#{name}](https://github.com/#{login})" }
-          sentences[group] = hash.values.sort.to_sentence
+          sentences[group] = hash.values.sort_by { |s| s.unicode_normalize(:nfd).gsub(/\P{L}+/, "") }.to_sentence
         end
 
         readme = HOMEBREW_REPOSITORY/"README.md"
@@ -54,9 +50,7 @@ module Homebrew
 
         File.write(readme, content)
 
-        diff = system_command "git", args: [
-          "-C", HOMEBREW_REPOSITORY, "diff", "--exit-code", "README.md", maintainer_json_relative_path
-        ]
+        diff = system_command "git", args: ["-C", HOMEBREW_REPOSITORY, "diff", "--exit-code", "README.md"]
         if diff.status.success?
           ofail "No changes to list of maintainers."
         else
