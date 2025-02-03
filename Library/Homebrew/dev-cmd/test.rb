@@ -1,11 +1,10 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "abstract_command"
 require "extend/ENV"
 require "sandbox"
 require "timeout"
-require "cli/parser"
 
 module Homebrew
   module DevCmd
@@ -36,6 +35,7 @@ module Homebrew
 
         require "formula_assertions"
         require "formula_free_port"
+        require "utils/fork"
 
         args.named.to_resolved_formulae.each do |f|
           # Cannot test uninstalled formulae
@@ -81,25 +81,29 @@ module Homebrew
 
             exec_args << "--HEAD" if f.head?
 
-            Utils.safe_fork do
-              if Sandbox.available?
-                sandbox = Sandbox.new
-                f.logs.mkpath
-                sandbox.record_log(f.logs/"test.sandbox.log")
-                sandbox.allow_write_temp_and_cache
-                sandbox.allow_write_log(f)
-                sandbox.allow_write_xcode
-                sandbox.allow_write_path(HOMEBREW_PREFIX/"var/cache")
-                sandbox.allow_write_path(HOMEBREW_PREFIX/"var/homebrew/locks")
-                sandbox.allow_write_path(HOMEBREW_PREFIX/"var/log")
-                sandbox.allow_write_path(HOMEBREW_PREFIX/"var/run")
-                sandbox.exec(*exec_args)
-              else
+            if Sandbox.available?
+              sandbox = Sandbox.new
+              f.logs.mkpath
+              sandbox.record_log(f.logs/"test.sandbox.log")
+              sandbox.allow_write_temp_and_cache
+              sandbox.allow_write_log(f)
+              sandbox.allow_write_xcode
+              sandbox.allow_write_path(HOMEBREW_PREFIX/"var/cache")
+              sandbox.allow_write_path(HOMEBREW_PREFIX/"var/homebrew/locks")
+              sandbox.allow_write_path(HOMEBREW_PREFIX/"var/log")
+              sandbox.allow_write_path(HOMEBREW_PREFIX/"var/run")
+              sandbox.deny_all_network unless f.class.network_access_allowed?(:test)
+              sandbox.run(*exec_args)
+            else
+              Utils.safe_fork do
                 exec(*exec_args)
               end
             end
+          # Rescue any possible exception types.
           rescue Exception => e # rubocop:disable Lint/RescueException
-            retry if retry_test?(f, args:)
+            retry if retry_test?(f)
+
+            require "utils/backtrace"
             ofail "#{f.full_name}: failed"
             $stderr.puts e, Utils::Backtrace.clean(e)
           ensure
@@ -110,8 +114,9 @@ module Homebrew
 
       private
 
-      def retry_test?(formula, args:)
-        @test_failed ||= Set.new
+      sig { params(formula: Formula).returns(T::Boolean) }
+      def retry_test?(formula)
+        @test_failed ||= T.let(Set.new, T.nilable(T::Set[T.untyped]))
         if args.retry? && @test_failed.add?(formula)
           oh1 "Testing #{formula.full_name} (again)"
           formula.clear_cache

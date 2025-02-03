@@ -1,20 +1,11 @@
-# typed: true
+# typed: true # rubocop:todo Sorbet/StrictSigil
 # frozen_string_literal: true
 
 require "cli/parser"
 require "erb"
-require "kramdown"
-require "manpages/parser/ronn"
-require "manpages/converter/kramdown"
-require "manpages/converter/roff"
 
-SOURCE_PATH = (HOMEBREW_LIBRARY_PATH/"manpages").freeze
-TARGET_MAN_PATH = (HOMEBREW_REPOSITORY/"manpages").freeze
-TARGET_DOC_PATH = (HOMEBREW_REPOSITORY/"docs").freeze
 module Homebrew
   # Helper functions for generating homebrew manual.
-  #
-  # @api private
   module Manpages
     Variables = Struct.new(
       :alumni,
@@ -31,8 +22,15 @@ module Homebrew
       keyword_init: true,
     )
 
+    SOURCE_PATH = (HOMEBREW_LIBRARY_PATH/"manpages").freeze
+    TARGET_MAN_PATH = (HOMEBREW_REPOSITORY/"manpages").freeze
+    TARGET_DOC_PATH = (HOMEBREW_REPOSITORY/"docs").freeze
+
     def self.regenerate_man_pages(quiet:)
-      Homebrew.install_bundler_gems!(groups: ["man"])
+      require "kramdown"
+      require "manpages/parser/ronn"
+      require "manpages/converter/kramdown"
+      require "manpages/converter/roff"
 
       markup = build_man_page(quiet:)
       root, warnings = Parser::Ronn.parse(markup)
@@ -81,7 +79,7 @@ module Homebrew
       man_page_lines = []
 
       # preserve existing manpage order
-      cmd_paths.sort_by(&method(:sort_key_for_path))
+      cmd_paths.sort_by { sort_key_for_path(_1) }
                .each do |cmd_path|
         cmd_man_page_lines = if (cmd_parser = Homebrew::CLI::Parser.from_cmd_path(cmd_path))
           next if cmd_parser.hide_from_man_page
@@ -99,9 +97,10 @@ module Homebrew
       man_page_lines.compact.join("\n")
     end
 
+    sig { params(cmd_parser: CLI::Parser).returns(T::Array[String]) }
     def self.cmd_parser_manpage_lines(cmd_parser)
       lines = [format_usage_banner(cmd_parser.usage_banner_text)]
-      lines += cmd_parser.processed_options.filter_map do |short, long, _, desc, hidden|
+      lines += cmd_parser.processed_options.filter_map do |short, long, desc, hidden|
         next if hidden
 
         if long.present?
@@ -145,7 +144,7 @@ module Homebrew
 
     sig { returns(String) }
     def self.global_cask_options_manpage
-      lines = ["These options are applicable to the `install`, `reinstall`, and `upgrade` " \
+      lines = ["These options are applicable to the `install`, `reinstall` and `upgrade` " \
                "subcommands with the `--cask` switch.\n"]
       lines += Homebrew::CLI::Parser.global_cask_options.map do |_, long, kwargs|
         generate_option_doc(nil, long.chomp("="), kwargs.fetch(:description))

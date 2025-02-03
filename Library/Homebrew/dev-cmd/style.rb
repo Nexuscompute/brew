@@ -5,7 +5,6 @@ require "abstract_command"
 require "json"
 require "open3"
 require "style"
-require "cli/parser"
 
 module Homebrew
   module DevCmd
@@ -44,6 +43,8 @@ module Homebrew
 
       sig { override.void }
       def run
+        Homebrew.install_bundler_gems!(groups: ["style"])
+
         target = if args.no_named?
           nil
         else

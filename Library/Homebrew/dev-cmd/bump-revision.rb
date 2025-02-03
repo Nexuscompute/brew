@@ -3,7 +3,6 @@
 
 require "abstract_command"
 require "formula"
-require "cli/parser"
 
 module Homebrew
   module DevCmd
@@ -33,6 +32,8 @@ module Homebrew
         # user path, too.
         ENV["PATH"] = PATH.new(ORIGINAL_PATHS).to_s
 
+        Homebrew.install_bundler_gems!(groups: ["ast"]) unless args.dry_run?
+
         args.named.to_formulae.each do |formula|
           current_revision = formula.revision
           new_revision = current_revision + 1
@@ -48,7 +49,6 @@ module Homebrew
               end
             end
           else
-            Homebrew.install_bundler_gems!(groups: ["ast"])
             require "utils/ast"
 
             formula_ast = Utils::AST::FormulaAST.new(formula.path.read)

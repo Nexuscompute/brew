@@ -1,8 +1,7 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "abstract_command"
-require "cli/parser"
 require "cask/cask"
 require "fileutils"
 require "formula"
@@ -53,7 +52,7 @@ module Homebrew
             html_template_name = html_template(name)
 
             unless args.dry_run?
-              File.write("_data/cask/#{name}.json", "#{json}\n")
+              File.write("_data/cask/#{name.tr("+", "_")}.json", "#{json}\n")
               File.write("api/cask/#{name}.json", CASK_JSON_TEMPLATE)
               File.write("api/cask-source/#{name}.rb", cask_source)
               File.write("cask/#{name}.html", html_template_name)
@@ -65,15 +64,18 @@ module Homebrew
 
           homebrew_cask_tap_json = JSON.generate(tap.to_internal_api_hash)
           File.write("api/internal/v3/homebrew-cask.json", homebrew_cask_tap_json) unless args.dry_run?
+          canonical_json = JSON.pretty_generate(tap.cask_renames)
+          File.write("_data/cask_canonical.json", "#{canonical_json}\n") unless args.dry_run?
         end
       end
 
       private
 
+      sig { params(title: String).returns(String) }
       def html_template(title)
         <<~EOS
           ---
-          title: #{title}
+          title: '#{title}'
           layout: cask
           ---
           {{ content }}
